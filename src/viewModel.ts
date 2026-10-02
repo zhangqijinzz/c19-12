@@ -1,6 +1,6 @@
 import { createElement, createStarterDocument, analyzeLayout, findElement, getBoundingBox, normalizeRotation } from './domain';
 import type { LayoutRepository } from './repository';
-import type { Analysis, ElementKind, LayoutDocument, LayoutMode, Notice, RenderElement, ViewPhase } from './types';
+import type { Analysis, ElementKind, LayoutDocument, LayoutMode, Notice, RenderElement, SaveStatus, ViewPhase } from './types';
 
 export interface ExpoSketchState {
   phase: ViewPhase;
@@ -11,6 +11,7 @@ export interface ExpoSketchState {
   mode: LayoutMode;
   analysis: Analysis;
   notice: Notice;
+  saveStatus: SaveStatus;
   lastSavedAt: number | null;
 }
 
@@ -19,6 +20,9 @@ const toRenderElements = (document: LayoutDocument): RenderElement[] => document
   return { ...element, displayWidth: box.width, displayHeight: box.height, occupiedArea: Number((box.width * box.height).toFixed(1)) };
 });
 
+const RETRY_BASE_DELAY = 2000;
+const RETRY_MAX_DELAY = 30000;
+
 const starter = createStarterDocument();
 const starterRenderElements = toRenderElements(starter);
 
@@ -26,6 +30,10 @@ type Listener = () => void;
 
 export class ExpoSketchViewModel {
   private listeners = new Set<Listener>();
+  private persistRunning = false;
+  private persistAgain = false;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryAttempts = 0;
   private stateValue: ExpoSketchState = {
     phase: 'loading',
     document: starter,
@@ -35,6 +43,7 @@ export class ExpoSketchViewModel {
     mode: 'edit',
     analysis: analyzeLayout(createStarterDocument()),
     notice: { tone: 'info', message: '正在恢复最近布局…' },
+    saveStatus: 'idle',
     lastSavedAt: null,
   };
 
@@ -114,18 +123,60 @@ export class ExpoSketchViewModel {
     this.commitAndPersist({ document, selectedId: 'stage-1', mode: 'edit', notice: { tone: 'success', message: '已恢复示例布局' } });
   }
 
+  retrySave() {
+    this.clearRetryTimer();
+    void this.persist();
+  }
+
   private commitAndPersist(patch: Partial<ExpoSketchState>) {
     this.commit(patch);
     void this.persist();
   }
 
   private async persist() {
+    if (this.persistRunning) {
+      this.persistAgain = true;
+      return;
+    }
+    this.persistRunning = true;
+    const recovering = this.stateValue.saveStatus === 'error';
+    this.commit({ saveStatus: 'saving' });
     try {
       await this.repository.save(this.stateValue.document);
-      this.commit({ lastSavedAt: Date.now() });
+      this.clearRetryTimer();
+      this.commit({
+        saveStatus: 'saved',
+        lastSavedAt: Date.now(),
+        ...(recovering ? { notice: { tone: 'success', message: '保存已恢复，全部更改已写入本地' } } : {}),
+      });
     } catch {
-      this.commit({ notice: { tone: 'error', message: '本地保存失败，当前编辑仍保留在页面中' } });
+      this.commit({ saveStatus: 'error', notice: { tone: 'error', message: '本地保存失败：浏览器存储空间可能不足，更改仅保留在当前页面，将自动重试' } });
+      this.scheduleRetry();
+    } finally {
+      this.persistRunning = false;
+      if (this.persistAgain) {
+        this.persistAgain = false;
+        void this.persist();
+      }
     }
+  }
+
+  private scheduleRetry() {
+    if (this.retryTimer !== null) return;
+    const delay = Math.min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * 2 ** this.retryAttempts);
+    this.retryAttempts += 1;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      void this.persist();
+    }, delay);
+  }
+
+  private clearRetryTimer() {
+    if (this.retryTimer !== null) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+    this.retryAttempts = 0;
   }
 
   private commit(patch: Partial<ExpoSketchState>) {

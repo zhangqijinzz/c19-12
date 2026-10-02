@@ -1,6 +1,7 @@
 export type ElementKind = 'booth' | 'stage' | 'seating' | 'entrance';
 export type LayoutMode = 'edit' | 'inspect' | 'path';
 export type ViewPhase = 'loading' | 'ready' | 'error';
+export type SaveStatus = 'idle' | 'saving' | 'saved' | 'error';
 
 export interface ExpoElement {
   id: string;
